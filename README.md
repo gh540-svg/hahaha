@@ -1,142 +1,195 @@
-# SSD-Subspace: Capability-Selective Self-Distillation via KV Subspace Projection
+# SSD-Subspace
 
-Single-script pipeline (`ssd_subspace.py`) that tests whether a small student model
-can self-distill a targeted capability by:
+**Capability-selective self-distillation via KV subspace projection.**
 
-1. **Finding** a low-rank capability subspace of the student's K/V activations
-2. **Projecting** K/V onto that subspace at selected attention layers during generation
-3. **Harvesting** self-samples produced under the projection
-4. **Training** the student on those self-samples (no projection during training)
+A small language model can be made better at a targeted capability — code, math, multiple-choice QA — by (1) finding a low-rank subspace of its own K/V activations that matters for *correctness*, (2) projecting K/V onto that subspace during self-sampling, (3) fine-tuning on the resulting self-samples with plain cross-entropy. **No teacher, no external verifier, no gold labels during fine-tuning.**
 
-Supported capabilities: **math** (GSM8K / SVAMP), **code** (MBPP / CodeAlpaca),
-**question answering** (MMLU with BBH transfer).
+The key empirical finding: **the loss function used to extract the subspace is what defines the capability.** Switching from full next-token CE to a correctness-aligned CE (gradient only on assertion tokens for code, answer tokens for math/MMLU) unlocks the method.
 
 ---
 
-## The 4 methods evaluated per run
-
-Every run produces all 4 — no separate flags required.
-
-| Method | Subspace hooks? | Training? | What it tests |
-|---|---|---|---|
-| `baseline` | ❌ | ❌ | Frozen student. Reference point. |
-| `inference_hooks` | ✅ at eval time | ❌ | Training-free: does the subspace projection alone help at inference? |
-| `ssd_plain` | ❌ anywhere | ✅ on unhooked self-samples | Vanilla self-distillation (no subspace). |
-| `ssd_enhanced` | ✅ during sample generation, ❌ during training | ✅ on hook-generated self-samples | The full method. Student trains on its hook-concentrated outputs. |
-
----
-
-## Requirements
-
-- Python 3.10+
-- `torch` (CUDA recommended, fp16 is default)
-- `transformers`, `peft`, `datasets`, `tqdm`, `numpy`
-- Disk: HuggingFace dataset cache (~5 GB for MMLU auxiliary_train, ~0.5 GB for MBPP/GSM8K/SVAMP/BBH)
-
-First run will download datasets; subsequent runs hit the cache.
-
----
-
-## Quickstart
-
-From the project root (`capability-selective-distillation/`):
+## TL;DR
 
 ```bash
-# Math: GSM8K training + dual eval on GSM8K test and SVAMP
-python ssd_subspace.py \
-    --task math --math_eval both \
-    --n_train 7473 --n_calibration 50 --n_eval 100 \
-    --output_dir results/my_math_run
+# Install
+pip install -r requirements.txt
 
-# Code: MBPP training + dual eval on MBPP pass@1 and CodeAlpaca NLL/AST
-python ssd_subspace.py \
-    --task code --code_train mbpp --code_eval both \
-    --n_train 2000 --n_calibration 50 --n_eval 100 \
-    --output_dir results/my_code_run
+# Run one task (e.g. code with assertion-only CE):
+bash scripts/run_single.sh code aligned
 
-# Question answering: MMLU training + dual eval on MMLU and BBH
-python ssd_subspace.py \
-    --task mmlu \
-    --n_train 2000 --n_calibration 500 --n_eval 200 \
-    --output_dir results/my_mmlu_run
+# Reproduce the full main table (6 runs, ~10-14h on a single 24 GB GPU):
+bash scripts/reproduce_all.sh
 ```
 
-Each run writes `results.json` into `--output_dir` with the 4 methods' metrics.
+Each run writes `results.json` to `results/<task>_<loss>/` with four methods:
+`baseline`, `inference_hooks`, `ssd_plain`, `ssd_enhanced`.
 
 ---
 
-## All command-line flags
+## Repository layout
+
+```
+.
+├── ssd_subspace.py        # main pipeline (all 4 methods, all 3 tasks)
+├── utils.py               # gradient collection, SVD, projection helpers
+├── requirements.txt       # pip dependencies
+├── scripts/
+│   ├── run_single.sh      # run one (task, loss) combination
+│   └── reproduce_all.sh   # run all 6 combinations + summary table
+└── examples/              # sample outputs (see below)
+```
+
+Two Python files, two bash scripts. Nothing else to read.
+
+---
+
+## Installation
+
+Tested on Python 3.10 / 3.11 with CUDA 12.1.
+
+```bash
+# 1. Clone
+git clone https://github.com/gh540-svg/hahaha.git ssd-subspace
+cd ssd-subspace
+
+# 2. Create an env (conda or venv, either works)
+conda create -n ssd python=3.11 -y
+conda activate ssd
+
+# 3. Install dependencies
+pip install -r requirements.txt
+```
+
+First-run dataset downloads will pull ~5 GB of HuggingFace caches (MMLU, MBPP, CodeAlpaca, GSM8K, SVAMP, BBH).
+
+### Hardware
+
+| Model | fp16 weights | Peak VRAM (LoRA r=8 fine-tuning) |
+|---|---|---|
+| Qwen2.5-0.5B-Instruct *(default)* | 1 GB | ~4 GB |
+| Qwen2.5-1.5B-Instruct | 3 GB | ~10 GB |
+| Qwen2.5-3B-Instruct | 6 GB | ~18 GB |
+| Llama-3.1-8B-Instruct | 16 GB | ~32 GB |
+
+---
+
+## The method in 4 steps
+
+```
+[1] Find     SVD on gradients of a calibration loss → per-layer rank-r
+             projection matrices P_K, P_V.
+[2] Hook     Register forward hooks at [last, middle] attention layers that
+             apply K → K·P_K and V → V·P_V.
+[3] Sample   With hooks active, student generates N completions from prompts.
+             No gold labels used; completions may be wrong.
+[4] Train    Hooks off. Fine-tune LoRA adapter on (prompt, completion) pairs
+             with plain next-token CE.
+```
+
+Every run of `ssd_subspace.py` produces **four methods** that together isolate each design choice:
+
+| Method | Hook at gen? | Hook at eval? | Fine-tuned? | What it tests |
+|---|---|---|---|---|
+| `baseline` | ❌ | ❌ | ❌ | Pre-training reference. |
+| `inference_hooks` | — | ✅ | ❌ | Training-free projection. |
+| `ssd_plain` | ❌ | ❌ | ✅ | Vanilla self-distillation (no subspace). |
+| `ssd_enhanced` | ✅ | ❌ | ✅ | SSD-Subspace (our method). |
+
+---
+
+## Quickstart — running one task
+
+```bash
+# Code: MBPP training, assertion-only CE for subspace, dual-eval (MBPP + CodeAlpaca)
+bash scripts/run_single.sh code aligned
+
+# Math: GSM8K training, answer-only CE, dual-eval (GSM8K + SVAMP)
+bash scripts/run_single.sh math aligned
+
+# MMLU: MMLU training, answer-only CE, dual-eval (MMLU + BBH)
+bash scripts/run_single.sh mmlu aligned
+
+# Use "default" instead of "aligned" for the vanilla-CE baseline variant:
+bash scripts/run_single.sh code default
+```
+
+Override the model via the `MODEL` env var:
+
+```bash
+MODEL=Qwen/Qwen2.5-1.5B-Instruct bash scripts/run_single.sh code aligned
+```
+
+---
+
+## Reproducing the paper's main table
+
+```bash
+bash scripts/reproduce_all.sh
+```
+
+This runs 3 tasks × 2 loss variants = 6 experiments sequentially, then prints a collated metric table at the end. Results land in `results/<task>_<loss>/results.json`.
+
+Expected approximate numbers with Qwen2.5-0.5B-Instruct:
+
+| Domain | Metric | `baseline` | `ssd_plain` | `ssd_enhanced` (aligned) |
+|---|---|---|---|---|
+| Code (MBPP) | pass@1 | 11.7% | 30.7% | **20.2%** |
+| Math | GSM8K / SVAMP | 11% / 16% | 11% / 12% | **19% / 27%** |
+| MMLU | MMLU / BBH | 46% / 32% | 48% / 38% | **48.5% / 37.3%** |
+
+`ssd_plain` is stronger on MBPP because hook-generated code samples can have damaged identifiers; `ssd_enhanced` wins on math and MMLU where the aligned subspace cleanly denoises generation.
+
+---
+
+## Command-line options
+
+All options live on `ssd_subspace.py`; `run_single.sh` just wraps the common ones.
 
 ### Core
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `--model` | `Qwen/Qwen2.5-0.5B-Instruct` | Student model. Any HF causal LM works; edit layer count logic if different architecture. |
-| `--task` | `math` | One of `math`, `code`, `mmlu`. |
-| `--n_train` | `7473` | Number of training prompts used for SSD sample generation and fine-tuning. |
-| `--n_calibration` | `50` | Calibration examples used for subspace gradient SVD. |
-| `--n_eval` | `100` | Eval examples per dataset. |
-| `--rank` | `64` | Rank of the capability subspace. |
-| `--epochs` | `5` | Fine-tuning epochs on self-samples. |
-| `--lr` | `1e-5` | Fine-tuning learning rate. |
-| `--lora_r` | `8` | LoRA rank for fine-tuning adapters. |
-| `--seed` | `42` | Torch/NumPy/random seed. |
-| `--layers` | `last_mid` | Either `last_mid` (auto: `[n_layers-1, n_layers//2]`) or a comma-separated list like `"23,12"` or `"12"` or `"15,12"`. |
-| `--output_dir` | `results/ssd_subspace` | Where `results.json`, training log files, and LoRA adapters are written. |
-| `--device` | `cuda` | Torch device. |
+| `--model` | `Qwen/Qwen2.5-0.5B-Instruct` | Any HF causal LM with standard `self_attn.{k_proj, v_proj}` |
+| `--task` | `math` | `math`, `code`, or `mmlu` |
+| `--n_train` | task-dependent | Number of prompts for SSD sample generation + fine-tuning |
+| `--n_calibration` | task-dependent | Examples used for gradient SVD |
+| `--n_eval` | `100`–`200` | Evaluation examples per dataset |
+| `--rank` | `64` | Subspace rank |
+| `--epochs` | `5` | Fine-tuning epochs |
+| `--lora_r` | `8` | LoRA rank for adapter |
+| `--lr` | `1e-5` | Fine-tuning learning rate |
+| `--seed` | `42` | RNG seed |
+| `--layers` | `last_mid` | `"last_mid"` (auto: `[L-1, L/2]`) or `"23,12"` etc. |
+| `--output_dir` | `results/ssd_subspace` | Where `results.json` is written |
 
-### Task-specific eval / train
-
-| Flag | Choices | Purpose |
-|---|---|---|
-| `--math_eval` | `svamp`, `gsm8k_test`, `both` | `svamp` = transfer, `gsm8k_test` = same-dataset, `both` = dual eval. |
-| `--code_train` | `mbpp`, `codealpaca` | Training prompt source. MBPP → same-dataset, CodeAlpaca → transfer. |
-| `--code_eval` | `mbpp_sanitized`, `codealpaca`, `both` | MBPP pass@1, CodeAlpaca NLL+AST-parse, or dual. |
-
-### Ablation knobs
+### Task-specific
 
 | Flag | Choices | Purpose |
 |---|---|---|
-| `--project_mode` | `both`, `k_only`, `v_only` | Which of K and V to project inside the hook. `k_only` preserves token content, useful for syntactically rigid tasks (code). |
-| `--calibration_source` | `default`, `mbpp_solutions`, `answer_only` | See next section. |
+| `--math_eval` | `svamp` / `gsm8k_test` / `both` | Math eval dataset(s) |
+| `--code_train` | `mbpp` / `codealpaca` | Code training source |
+| `--code_eval` | `mbpp_sanitized` / `codealpaca` / `both` | Code eval dataset(s) |
+
+### The key ablation knob
+
+| Flag | Choices | Purpose |
+|---|---|---|
+| `--calibration_source` | `default` / `mbpp_solutions` / `answer_only` | Which tokens contribute gradient during subspace extraction |
+| `--project_mode` | `both` / `k_only` / `v_only` | Project K, V, or both |
 
 ---
 
-## Subspace loss functions (`--calibration_source`)
+## The two loss variants (the central finding)
 
-The subspace is built by SVD on gradients of a CE loss over calibration texts.
-**Which tokens contribute to the loss determines which KV directions the subspace captures** — this is the most important research knob.
+Both variants use next-token cross-entropy. They differ only in which tokens' labels are *not* masked to `-100`:
 
-| Option | Valid tasks | What contributes to the loss | What the subspace captures |
+| Variant | `--calibration_source` | Valid tasks | Tokens that contribute gradient |
 |---|---|---|---|
-| `default` | all | Every token in the calibration text | "KV directions for reproducing training-distribution text" (broad, includes scaffolding) |
-| `mbpp_solutions` | `code` | Only tokens inside `assert ...` test strings in each MBPP prompt | "KV directions for predicting the test assertions" — execution-correctness-aligned |
-| `answer_only` | `math`, `mmlu` | Only the final answer tokens (the numeric answer after `#### ` in GSM8K; the letter after `Answer: ` in MMLU) | "KV directions for picking the correct final answer" |
+| Full CE | `default` | all | Every token in calibration text |
+| Assertion-only CE | `mbpp_solutions` | code | Only tokens inside `assert …` strings |
+| Answer-only CE | `answer_only` | math / mmlu | Only the numeric or letter answer |
 
-Empirically, the correctness-aligned variants (`mbpp_solutions` / `answer_only`)
-consistently outperform `default` for `ssd_enhanced`. See *Findings* below.
-
----
-
-## What each run does (pipeline)
-
-```
-[1] baseline eval (frozen student, no hooks)
-[2] compute capability subspace
-     forward+backward on calibration texts → SVD → rank-r projection matrices P_K, P_V
-     at each target layer
-[3] inference_hooks eval (hooks active on frozen student)
-[4] generate PLAIN self-samples (hooks off)
-[5] generate ENHANCED self-samples (hooks on)
-[6] train a LoRA adapter on the plain samples → eval → save as ssd_plain
-[7] train a LoRA adapter on the enhanced samples → eval → save as ssd_enhanced
-    (no hooks during training; standard next-token CE on whole sample)
-[8] write results.json
-```
-
-Samples in steps [4] and [5] are `prompt + student-generated-completion` — **no
-ground-truth answers are ever spliced into training data.** Ground-truth answers
-only appear in calibration texts (step [2], discarded after SVD).
+Empirically, the correctness-aligned variants consistently outperform `default` for `ssd_enhanced` (MBPP: **6.6% → 20.2%**; GSM8K: **13% → 19%**; MMLU: **48% → 48.5%**).
 
 ---
 
@@ -144,7 +197,7 @@ only appear in calibration texts (step [2], discarded after SVD).
 
 ```jsonc
 {
-  "timestamp": "...",
+  "timestamp": "2026-…",
   "config": { /* all CLI args */ },
   "target_layers": [23, 12],
   "projections": {
@@ -152,7 +205,7 @@ only appear in calibration texts (step [2], discarded after SVD).
     "12": { "energy_K": 0.99, "energy_V": 0.94 }
   },
   "results": {
-    "baseline":        { /* primary metric + any dual-eval sub-metrics */ },
+    "baseline":        { /* primary metric + dual-eval sub-metrics */ },
     "inference_hooks": { /* same shape */ },
     "ssd_plain":       { /* + train_losses, best_loss, best_epoch */ },
     "ssd_enhanced":    { /* same */ }
@@ -160,107 +213,64 @@ only appear in calibration texts (step [2], discarded after SVD).
 }
 ```
 
-Metric keys by task/eval:
+Primary-metric keys by task and eval:
 
-| Task / eval | Primary | Extras |
+| Task / eval | Primary metric | Secondary |
 |---|---|---|
-| math / svamp | `accuracy` | `correct`, `total` |
-| math / gsm8k_test | `accuracy` | `correct`, `total` |
-| math / both | `gsm8k_accuracy` | `svamp_accuracy`, `{correct,total}` each |
-| code / mbpp_sanitized | `pass@1` | `correct`, `total` |
-| code / codealpaca | `nll`, `ast_parse_rate` | `ppl`, `parses`, `total` |
-| code / both | `mbpp_pass@1` | `ca_nll`, `ca_ast_parse_rate`, ... |
-| mmlu | `mmlu_accuracy` | `bbh_accuracy`, `bbh_per_task_accuracy` (6 subtasks) |
+| math / svamp \| gsm8k_test | `accuracy` | — |
+| math / both | `gsm8k_accuracy` | `svamp_accuracy` |
+| code / mbpp_sanitized | `pass@1` | — |
+| code / codealpaca | `nll`, `ast_parse_rate` | `ppl` |
+| code / both | `mbpp_pass@1` | `ca_nll`, `ca_ast_parse_rate` |
+| mmlu | `mmlu_accuracy` | `bbh_accuracy`, `bbh_per_task_accuracy` |
 
-For `ssd_plain` / `ssd_enhanced`, an additional `train_losses` array (per epoch),
-`best_loss`, `best_epoch` are recorded.
-
-LoRA adapters are saved into `<output_dir>/student_ssd_plain_seed{SEED}/` and
-`<output_dir>/student_ssd_enhanced_seed{SEED}/` (loadable via `peft.PeftModel`).
+`ssd_plain` and `ssd_enhanced` also record `train_losses[]`, `best_loss`, `best_epoch`. Trained LoRA adapters are saved to `<output_dir>/student_{ssd_plain,ssd_enhanced}_seed{SEED}/`, loadable with `peft.PeftModel`.
 
 ---
 
-## Example commands — reproducing our findings
+## Datasets
 
-### Math, correctness-aligned subspace (best for transfer)
-```bash
-python ssd_subspace.py \
-    --task math --math_eval both \
-    --calibration_source answer_only \
-    --n_train 7473 --n_calibration 50 --n_eval 100 \
-    --output_dir results/math_answer_only
-```
+| Domain | In-domain (train + eval) | Transfer (eval only) |
+|---|---|---|
+| Code | MBPP (`mbpp`, `sanitized` split) | CodeAlpaca-20k (`sahil2801/CodeAlpaca-20k`) |
+| Math | GSM8K (`openai/gsm8k`, `main`) | SVAMP (`ChilleD/SVAMP`) |
+| QA | MMLU (`cais/mmlu`, `all`) | BBH (`lukaemon/bbh`), 6 subtasks |
 
-### Code, execution-aware subspace (best ssd_enhanced for MBPP pass@1)
-```bash
-python ssd_subspace.py \
-    --task code --code_train mbpp --code_eval both \
-    --calibration_source mbpp_solutions \
-    --n_train 2000 --n_calibration 50 --n_eval 100 \
-    --output_dir results/code_execaware
-```
+All datasets are auto-downloaded via the HuggingFace `datasets` library on first use.
 
-### MMLU, answer-only subspace + BBH transfer eval
-```bash
-python ssd_subspace.py \
-    --task mmlu \
-    --calibration_source answer_only \
-    --n_train 2000 --n_calibration 500 --n_eval 200 \
-    --output_dir results/mmlu_answer_only
-```
+BBH subtasks used (all single-token answer formats):
+`logical_deduction_three_objects`, `date_understanding`, `movie_recommendation`, `boolean_expressions`, `causal_judgement`, `sports_understanding`.
 
-### Layer ablation — project only middle layer
-```bash
-python ssd_subspace.py \
-    --task code --code_train mbpp --code_eval both \
-    --layers "12" \
-    --output_dir results/code_mid_only
-```
+---
 
-### Project K only, preserve V (code-friendly)
-```bash
-python ssd_subspace.py \
-    --task code --code_train mbpp --code_eval both \
-    --project_mode k_only \
-    --output_dir results/code_kproj_only
+## Windows users
+
+The bash scripts work under Git Bash / WSL. For native PowerShell you can run:
+
+```powershell
+python ssd_subspace.py --task mmlu --calibration_source answer_only `
+    --n_train 2000 --n_calibration 500 --n_eval 200 `
+    --output_dir results/mmlu_aligned
 ```
 
 ---
 
-## Findings
+## FAQ
 
-Across all three domains:
+**Q: Does this need a teacher model?**
+No. The student bootstraps from its own generations. Ground-truth answers only appear in calibration texts (for SVD) and eval targets — never as fine-tuning labels.
 
-- The **inference-time hook** helps only when the subspace is built from a
-  correctness-aligned loss (`mbpp_solutions` / `answer_only`). With `default`
-  CE, the hook often hurts because the subspace captures style, not correctness.
+**Q: Why are `ssd_plain` samples sometimes as good as `ssd_enhanced`?**
+When the task is already well-formed (MBPP code completion), the student's natural samples are often on-manifold. The subspace projection helps most when the natural distribution has substantial off-capability noise (math reasoning, MMLU letter answers).
 
-- **`ssd_enhanced`** gives the largest gains when the correctness-aligned
-  subspace is paired with the projection:
-  - Code MBPP pass@1: **6.6% → 20.2%** switching `default` → `mbpp_solutions`
-  - MMLU: **48.0% → 48.5%**, BBH transfer **35.7% → 37.3%** switching `default` → `answer_only`
-  - Math SVAMP transfer: `ssd_enhanced` reached **24%** vs baseline 16% even with `default`; `answer_only` results pending.
+**Q: Do I need GPUs for all 6 reproduction runs?**
+Yes, realistically. CPU fine-tuning on 7473 GSM8K samples would take days. A single consumer GPU (RTX 3090 / 4090) handles Qwen2.5-0.5B comfortably.
 
-- The subspace's **rank-64 captured energy** jumps from ~94–98% (`default`) to
-  ~99.5–100% (correctness-aligned). The gradient matrix is lower-rank because
-  only a handful of tokens per example contribute — this is a feature, not a
-  bug: the subspace becomes a sharper correctness filter.
-
-- **No ground-truth answers are used during fine-tuning.** The improvement
-  comes from training on *self-generated but subspace-concentrated* samples.
-  The wrong content averages out; the on-manifold structure accumulates into
-  the weights.
+**Q: Can I scale up the student model?**
+Yes — just pass `--model` or set `MODEL`. Increase `--rank` to 128 or 256 for models with `d_kv ≥ 1024`. Reduce `--n_train` if you're memory-bound.
 
 ---
 
-## File layout
+## License
 
-```
-./
-├── ssd_subspace.py     # the main pipeline (all 4 methods + all 3 tasks)
-├── utils.py            # gradient collection, SVD, projection helpers
-└── README.md           # this file
-```
-
-Just two Python files. Run with plain `python ssd_subspace.py --task ...`
-— no installation step beyond `pip install torch transformers peft datasets tqdm numpy`.
+The code in this repository is released under MIT. Dataset licenses follow their respective sources on HuggingFace.
