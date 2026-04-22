@@ -11,7 +11,7 @@
 set -eu
 TASK="${1:?usage: $0 <code|math|mmlu> [default|aligned]}"
 LOSS="${2:-aligned}"
-MODEL="${MODEL:-Qwen/Qwen2.5-0.5B-Instruct}"
+MODEL="${MODEL:-Qwen/Qwen3-0.6B}"
 OUT_BASE="${OUT_BASE:-results}"
 
 case "$TASK" in

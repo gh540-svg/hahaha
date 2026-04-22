@@ -14,8 +14,12 @@ The key empirical finding: **the loss function used to extract the subspace is w
 # Install
 pip install -r requirements.txt
 
-# Run one task (e.g. code with assertion-only CE):
+# Run one task (e.g. code with assertion-only CE) on the default student:
 bash scripts/run_single.sh code aligned
+
+# Use a larger student — MODEL is an env var, any HF causal LM works:
+MODEL=Qwen/Qwen3-4B  bash scripts/run_single.sh code aligned
+MODEL=Qwen/Qwen3-14B bash scripts/run_single.sh code aligned
 
 # Reproduce the full main table (6 runs, ~10-14h on a single 24 GB GPU):
 bash scripts/reproduce_all.sh
@@ -62,14 +66,23 @@ pip install -r requirements.txt
 
 First-run dataset downloads will pull ~5 GB of HuggingFace caches (MMLU, MBPP, CodeAlpaca, GSM8K, SVAMP, BBH).
 
-### Hardware
+### Students used in the paper
 
-| Model | fp16 weights | Peak VRAM (LoRA r=8 fine-tuning) |
-|---|---|---|
-| Qwen2.5-0.5B-Instruct *(default)* | 1 GB | ~4 GB |
-| Qwen2.5-1.5B-Instruct | 3 GB | ~10 GB |
-| Qwen2.5-3B-Instruct | 6 GB | ~18 GB |
-| Llama-3.1-8B-Instruct | 16 GB | ~32 GB |
+| Model | Params | fp16 weights | Peak VRAM (LoRA r=8) | `transformers` needed |
+|---|---|---|---|---|
+| **`Qwen/Qwen3-0.6B`** *(default)* | 0.6B | 1.2 GB | ~4–5 GB | ≥ 4.51 |
+| **`Qwen/Qwen3-4B`** | 4B | 8 GB | ~16–20 GB | ≥ 4.51 |
+| **`Qwen/Qwen3-14B`** | 14B | 28 GB | ~48–56 GB | ≥ 4.51 |
+
+All three are **pure-text, standard-GQA** base models (no VLM, no hybrid attention) — drop-in compatible with the code. Qwen3-14B fits on a single A100-80GB; 4B fits on an RTX-4090 (24 GB); 0.6B fits on almost anything.
+
+Pick your student by setting the `MODEL` env var:
+
+```bash
+MODEL=Qwen/Qwen3-0.6B  bash scripts/reproduce_all.sh   # ~10-14 h on RTX-4090
+MODEL=Qwen/Qwen3-4B    bash scripts/reproduce_all.sh   # ~30-40 h on RTX-4090 / ~12 h on A100-80
+MODEL=Qwen/Qwen3-14B   bash scripts/reproduce_all.sh   # ~30-50 h on A100-80 (slow generation)
+```
 
 ---
 
@@ -113,10 +126,11 @@ bash scripts/run_single.sh mmlu aligned
 bash scripts/run_single.sh code default
 ```
 
-Override the model via the `MODEL` env var:
+Override the student via the `MODEL` env var:
 
 ```bash
-MODEL=Qwen/Qwen2.5-1.5B-Instruct bash scripts/run_single.sh code aligned
+MODEL=Qwen/Qwen3-4B  bash scripts/run_single.sh math aligned
+MODEL=Qwen/Qwen3-14B bash scripts/run_single.sh mmlu aligned
 ```
 
 ---
@@ -129,7 +143,7 @@ bash scripts/reproduce_all.sh
 
 This runs 3 tasks × 2 loss variants = 6 experiments sequentially, then prints a collated metric table at the end. Results land in `results/<task>_<loss>/results.json`.
 
-Expected approximate numbers with Qwen2.5-0.5B-Instruct:
+Expected approximate numbers — reference scales (Qwen2.5-0.5B-Instruct, reported in the paper). Rerun with Qwen3-0.6B / -4B / -14B to reproduce the scaling study:
 
 | Domain | Metric | `baseline` | `ssd_plain` | `ssd_enhanced` (aligned) |
 |---|---|---|---|---|
@@ -137,7 +151,7 @@ Expected approximate numbers with Qwen2.5-0.5B-Instruct:
 | Math | GSM8K / SVAMP | 11% / 16% | 11% / 12% | **19% / 27%** |
 | MMLU | MMLU / BBH | 46% / 32% | 48% / 38% | **48.5% / 37.3%** |
 
-`ssd_plain` is stronger on MBPP because hook-generated code samples can have damaged identifiers; `ssd_enhanced` wins on math and MMLU where the aligned subspace cleanly denoises generation.
+`ssd_plain` is stronger on MBPP because hook-generated code samples can have damaged identifiers; `ssd_enhanced` wins on math and MMLU where the aligned subspace cleanly denoises generation. Effect sizes change with scale — see the paper's Table 4 for per-model breakdowns.
 
 ---
 
@@ -149,7 +163,7 @@ All options live on `ssd_subspace.py`; `run_single.sh` just wraps the common one
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `--model` | `Qwen/Qwen2.5-0.5B-Instruct` | Any HF causal LM with standard `self_attn.{k_proj, v_proj}` |
+| `--model` | `Qwen/Qwen3-0.6B` | Any HF causal LM with standard `self_attn.{k_proj, v_proj}`. We report Qwen3-0.6B / 4B / 14B in the paper. |
 | `--task` | `math` | `math`, `code`, or `mmlu` |
 | `--n_train` | task-dependent | Number of prompts for SSD sample generation + fine-tuning |
 | `--n_calibration` | task-dependent | Examples used for gradient SVD |
@@ -267,7 +281,10 @@ When the task is already well-formed (MBPP code completion), the student's natur
 Yes, realistically. CPU fine-tuning on 7473 GSM8K samples would take days. A single consumer GPU (RTX 3090 / 4090) handles Qwen2.5-0.5B comfortably.
 
 **Q: Can I scale up the student model?**
-Yes — just pass `--model` or set `MODEL`. Increase `--rank` to 128 or 256 for models with `d_kv ≥ 1024`. Reduce `--n_train` if you're memory-bound.
+Yes — the paper runs Qwen3-0.6B, Qwen3-4B, and Qwen3-14B under the identical pipeline. Just pass `--model` or set `MODEL`. Increase `--rank` to 128 or 256 for models with `d_kv ≥ 1024` (Qwen3-0.6B: `d_kv`=1024; Qwen3-4B: 512; Qwen3-14B: 1024). Reduce `--n_train` if you're memory-bound.
+
+**Q: Why Qwen3 and not Qwen2.5 or Qwen3.5?**
+Qwen3 covers the scaling range (0.6B → 14B) we need, is pure-text (no VLM complications), and uses standard full-attention GQA at every layer. Qwen3.5 variants are multimodal VLMs with hybrid linear/full attention that don't cleanly expose `k_proj`/`v_proj` at every layer — incompatible with our hook design without substantial code changes.
 
 ---
 
