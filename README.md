@@ -18,8 +18,10 @@ pip install -r requirements.txt
 bash scripts/run_single.sh code aligned
 
 # Use a larger student — MODEL is an env var, any HF causal LM works:
-MODEL=Qwen/Qwen3-4B  bash scripts/run_single.sh code aligned
-MODEL=Qwen/Qwen3-14B bash scripts/run_single.sh code aligned
+MODEL=Qwen/Qwen2.5-7B-Instruct        bash scripts/run_single.sh code aligned
+MODEL=Qwen/Qwen2.5-14B-Instruct       bash scripts/run_single.sh code aligned
+MODEL=Qwen/Qwen3-4B-Instruct-2507     bash scripts/run_single.sh code aligned
+MODEL=Qwen/Qwen3-14B-Instruct-2507    bash scripts/run_single.sh code aligned
 
 # Reproduce the full main table (6 runs, ~10-14h on a single 24 GB GPU):
 bash scripts/reproduce_all.sh
@@ -68,20 +70,29 @@ First-run dataset downloads will pull ~5 GB of HuggingFace caches (MMLU, MBPP, C
 
 ### Students used in the paper
 
-| Model | Params | fp16 weights | Peak VRAM (LoRA r=8) | `transformers` needed |
-|---|---|---|---|---|
-| **`Qwen/Qwen3-0.6B`** *(default)* | 0.6B | 1.2 GB | ~4–5 GB | ≥ 4.51 |
-| **`Qwen/Qwen3-4B`** | 4B | 8 GB | ~16–20 GB | ≥ 4.51 |
-| **`Qwen/Qwen3-14B`** | 14B | 28 GB | ~48–56 GB | ≥ 4.51 |
+Scaling study across five Qwen Instruct checkpoints (all chat-tuned, standard-GQA pure-text models — drop-in compatible with the code):
 
-All three are **pure-text, standard-GQA** base models (no VLM, no hybrid attention) — drop-in compatible with the code. Qwen3-14B fits on a single A100-80GB; 4B fits on an RTX-4090 (24 GB); 0.6B fits on almost anything.
+| Model | Family | Params | fp16 weights | Peak VRAM (LoRA r=8) | `transformers` |
+|---|---|---|---|---|---|
+| **`Qwen/Qwen2.5-0.5B-Instruct`** *(default)* | Qwen2.5 | 0.5B | 1 GB | ~4 GB | ≥ 4.44 |
+| **`Qwen/Qwen2.5-7B-Instruct`** | Qwen2.5 | 7B | 14 GB | ~28 GB | ≥ 4.44 |
+| **`Qwen/Qwen2.5-14B-Instruct`** | Qwen2.5 | 14B | 28 GB | ~48–56 GB | ≥ 4.44 |
+| **`Qwen/Qwen3-4B-Instruct-2507`** | Qwen3 | 4B | 8 GB | ~16–20 GB | ≥ 4.51 |
+| **`Qwen/Qwen3-14B-Instruct-2507`** | Qwen3 | 14B | 28 GB | ~48–56 GB | ≥ 4.51 |
 
-Pick your student by setting the `MODEL` env var:
+Design — both Qwen2.5 and Qwen3 families are included so reviewers can separate **scaling effects** (0.5 → 14B inside Qwen2.5) from **architecture effects** (Qwen2.5-14B vs Qwen3-14B at the same size).
+
+Pick your student by setting `MODEL`:
 
 ```bash
-MODEL=Qwen/Qwen3-0.6B  bash scripts/reproduce_all.sh   # ~10-14 h on RTX-4090
-MODEL=Qwen/Qwen3-4B    bash scripts/reproduce_all.sh   # ~30-40 h on RTX-4090 / ~12 h on A100-80
-MODEL=Qwen/Qwen3-14B   bash scripts/reproduce_all.sh   # ~30-50 h on A100-80 (slow generation)
+# Qwen2.5 family (any transformers ≥ 4.44)
+MODEL=Qwen/Qwen2.5-0.5B-Instruct   bash scripts/reproduce_all.sh   # ~10-14 h on RTX-4090
+MODEL=Qwen/Qwen2.5-7B-Instruct     bash scripts/reproduce_all.sh   # ~24-32 h on A100-80
+MODEL=Qwen/Qwen2.5-14B-Instruct    bash scripts/reproduce_all.sh   # ~48-60 h on A100-80
+
+# Qwen3 family (requires transformers ≥ 4.51 — pip install -r requirements.txt)
+MODEL=Qwen/Qwen3-4B-Instruct-2507  bash scripts/reproduce_all.sh   # ~30-40 h on RTX-4090
+MODEL=Qwen/Qwen3-14B-Instruct-2507 bash scripts/reproduce_all.sh   # ~60-80 h on A100-80
 ```
 
 ---
@@ -89,8 +100,9 @@ MODEL=Qwen/Qwen3-14B   bash scripts/reproduce_all.sh   # ~30-50 h on A100-80 (sl
 ## The method in 4 steps
 
 ```
-[1] Find     SVD on gradients of a calibration loss → per-layer rank-r
-             projection matrices P_K, P_V.
+[1] Find     SVD on gradients of a calibration loss → per-layer projection
+             matrices P_K, P_V. Rank is auto-selected per layer to preserve
+             95% of gradient energy (so it adapts to each model's d_kv).
 [2] Hook     Register forward hooks at [last, middle] attention layers that
              apply K → K·P_K and V → V·P_V.
 [3] Sample   With hooks active, student generates N completions from prompts.
@@ -129,8 +141,8 @@ bash scripts/run_single.sh code default
 Override the student via the `MODEL` env var:
 
 ```bash
-MODEL=Qwen/Qwen3-4B  bash scripts/run_single.sh math aligned
-MODEL=Qwen/Qwen3-14B bash scripts/run_single.sh mmlu aligned
+MODEL=Qwen/Qwen3-4B-Instruct-2507  bash scripts/run_single.sh math aligned
+MODEL=Qwen/Qwen3-14B-Instruct-2507 bash scripts/run_single.sh mmlu aligned
 ```
 
 ---
@@ -168,7 +180,8 @@ All options live on `ssd_subspace.py`; `run_single.sh` just wraps the common one
 | `--n_train` | task-dependent | Number of prompts for SSD sample generation + fine-tuning |
 | `--n_calibration` | task-dependent | Examples used for gradient SVD |
 | `--n_eval` | `100`–`200` | Evaluation examples per dataset |
-| `--rank` | `64` | Subspace rank |
+| `--rank` | `0` (auto) | Subspace rank. `0` = auto via `--rank_energy`. `>0` forces fixed rank. |
+| `--rank_energy` | `0.95` | If `--rank=0`, pick rank per (layer, K/V) that preserves this fraction of gradient energy. |
 | `--epochs` | `5` | Fine-tuning epochs |
 | `--lora_r` | `8` | LoRA rank for adapter |
 | `--lr` | `1e-5` | Fine-tuning learning rate |
@@ -281,10 +294,13 @@ When the task is already well-formed (MBPP code completion), the student's natur
 Yes, realistically. CPU fine-tuning on 7473 GSM8K samples would take days. A single consumer GPU (RTX 3090 / 4090) handles Qwen2.5-0.5B comfortably.
 
 **Q: Can I scale up the student model?**
-Yes — the paper runs Qwen3-0.6B, Qwen3-4B, and Qwen3-14B under the identical pipeline. Just pass `--model` or set `MODEL`. Increase `--rank` to 128 or 256 for models with `d_kv ≥ 1024` (Qwen3-0.6B: `d_kv`=1024; Qwen3-4B: 512; Qwen3-14B: 1024). Reduce `--n_train` if you're memory-bound.
+Yes — the paper runs five Qwen Instruct checkpoints (Qwen2.5-0.5B / 7B / 14B and Qwen3-4B / 14B, all `-Instruct` variants) under the identical pipeline. Just pass `--model` or set `MODEL`. No need to hand-tune `--rank` for different model sizes — the default `--rank 0 --rank_energy 0.95` auto-selects rank per layer.
 
-**Q: Why Qwen3 and not Qwen2.5 or Qwen3.5?**
-Qwen3 covers the scaling range (0.6B → 14B) we need, is pure-text (no VLM complications), and uses standard full-attention GQA at every layer. Qwen3.5 variants are multimodal VLMs with hybrid linear/full attention that don't cleanly expose `k_proj`/`v_proj` at every layer — incompatible with our hook design without substantial code changes.
+**Q: How does `--rank 0 --rank_energy 0.95` work?**
+For each target layer and each of K / V separately, we compute the full SVD of the gradient matrix, then pick the smallest rank whose top singular values cumulatively capture ≥95% of the squared energy. This lets the rank adapt to the model's `d_kv` (which differs wildly across families — Qwen2.5-0.5B has `d_kv=128`; Qwen3-4B has `d_kv=512`; Qwen3-14B has `d_kv=1024`). Fixed rank=64 would be a drastically different fraction of the KV space on each.
+
+**Q: Why Qwen2.5 AND Qwen3, both Instruct?**
+Qwen2.5 covers three sizes (0.5B / 7B / 14B) with mature tooling (transformers ≥ 4.44). Qwen3 adds two more (4B / 14B Instruct-2507) with the newer architecture (8 KV heads, wider `d_kv`). Together we get five data points that separate **scaling** (Qwen2.5: 0.5B → 14B) from **architecture** (Qwen2.5-14B vs Qwen3-14B at the same size). All five are pure-text, standard-GQA — compatible with the hook design. Multimodal Qwen3.5 variants (e.g. `Qwen3.5-0.8B`) use hybrid linear/full attention that doesn't cleanly expose `k_proj`/`v_proj` at every layer, so they're out of scope here.
 
 ---
 

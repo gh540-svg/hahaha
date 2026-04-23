@@ -427,17 +427,27 @@ class SubspaceHooks:
 
 def compute_student_projections(model, tokenizer, calibration_texts,
                                  target_layers, rank, device, max_length=256,
-                                 label_char_spans=None):
+                                 label_char_spans=None, energy_threshold=None):
+    """If energy_threshold is set (e.g. 0.95), rank is auto-chosen per (layer, K/V)
+    to preserve that fraction of gradient energy. Otherwise, uses fixed rank."""
     grads = collect_kv_gradients(model, tokenizer, calibration_texts,
                                    target_layers, max_length=max_length, device=device,
                                    label_char_spans=label_char_spans)
+    # If auto-rank is requested, don't pass a fixed rank.
+    extract_kwargs = {}
+    if energy_threshold is not None:
+        extract_kwargs["energy_threshold"] = energy_threshold
+    else:
+        extract_kwargs["rank"] = rank
     projections = {}
     for layer in target_layers:
-        V_k, S_k, r_k = extract_subspace(grads[layer]["K_grads"], rank=rank)
-        V_v, S_v, r_v = extract_subspace(grads[layer]["V_grads"], rank=rank)
+        V_k, S_k, r_k = extract_subspace(grads[layer]["K_grads"], **extract_kwargs)
+        V_v, S_v, r_v = extract_subspace(grads[layer]["V_grads"], **extract_kwargs)
         projections[layer] = {
             "P_K": compute_projection_matrix(V_k),
             "P_V": compute_projection_matrix(V_v),
+            "rank_K": int(r_k),
+            "rank_V": int(r_v),
             "energy_K": float((S_k[:r_k]**2).sum() / (S_k**2).sum()),
             "energy_V": float((S_v[:r_v]**2).sum() / (S_v**2).sum()),
         }
@@ -570,7 +580,12 @@ def main():
                         help="Math: 7473 GSM8K. Code: 464 MBPP train+val.")
     parser.add_argument("--n_calibration", type=int, default=50)
     parser.add_argument("--n_eval", type=int, default=100)
-    parser.add_argument("--rank", type=int, default=64)
+    parser.add_argument("--rank", type=int, default=0,
+                        help="Subspace rank. 0 (default) = auto via --rank_energy. "
+                             "Set >0 to force a fixed rank and ignore energy threshold.")
+    parser.add_argument("--rank_energy", type=float, default=0.95,
+                        help="If --rank is 0, auto-select rank per (layer, K/V) to "
+                             "preserve this fraction of gradient energy. Default 0.95.")
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--lora_r", type=int, default=8)
@@ -842,12 +857,17 @@ def main():
     print(f"  baseline: {metric_name}={r[metric_name]:.4f}")
 
     # 2) Compute student's AutoKV projections at target layers
-    print(f"\n[2] Computing student's AutoKV subspace at layers {target_layers}...")
+    energy_thr = args.rank_energy if args.rank <= 0 else None
+    mode_desc = (f"energy-threshold {args.rank_energy:.3f} (auto rank)"
+                 if energy_thr is not None else f"fixed rank {args.rank}")
+    print(f"\n[2] Computing student's AutoKV subspace at layers {target_layers} ({mode_desc})...")
     projections = compute_student_projections(
         student, tok, cal_texts, target_layers, args.rank, args.device,
-        label_char_spans=locals().get("cal_label_spans"))
+        label_char_spans=locals().get("cal_label_spans"),
+        energy_threshold=energy_thr)
     for layer, p in projections.items():
-        print(f"  L{layer}: K_energy={p['energy_K']:.3f}, V_energy={p['energy_V']:.3f}")
+        print(f"  L{layer}: rank_K={p['rank_K']:3d} (energy {p['energy_K']:.3f}), "
+              f"rank_V={p['rank_V']:3d} (energy {p['energy_V']:.3f})")
 
     # 3) Eval with hooks (training-free inference-time projection)
     print(f"\n[3] Eval with inference-time hooks (mode={args.project_mode})...")
@@ -918,7 +938,8 @@ def main():
         json.dump({"timestamp": datetime.now().isoformat(),
                     "config": vars(args), "target_layers": target_layers,
                     "projections": {
-                        str(l): {"energy_K": p["energy_K"], "energy_V": p["energy_V"]}
+                        str(l): {"rank_K": p["rank_K"], "rank_V": p["rank_V"],
+                                  "energy_K": p["energy_K"], "energy_V": p["energy_V"]}
                         for l, p in projections.items()
                     },
                     "results": results}, f, indent=2, default=str)
