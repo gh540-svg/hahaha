@@ -4,7 +4,7 @@
 
 A small language model can be made better at a targeted capability — code, math, multiple-choice QA — by (1) finding a low-rank subspace of its own K/V activations that matters for *correctness*, (2) projecting K/V onto that subspace during self-sampling, (3) fine-tuning on the resulting self-samples with plain cross-entropy. **No teacher, no external verifier, no gold labels during fine-tuning.**
 
-The key empirical finding: **the loss function used to extract the subspace is what defines the capability.** Switching from full next-token CE to a correctness-aligned CE (gradient only on assertion tokens for code, answer tokens for math/MMLU) unlocks the method.
+The key insight: **correctness-aligned CE** (gradient only on assertion tokens for code, answer tokens for math/MMLU) extracts a subspace that captures the capability signal, not surface-level token distributions.
 
 ---
 
@@ -14,20 +14,20 @@ The key empirical finding: **the loss function used to extract the subspace is w
 # Install
 pip install -r requirements.txt
 
-# Run one task (e.g. code with assertion-only CE) on the default student:
-bash scripts/run_single.sh code aligned
+# Run one task (e.g. code) on the default student:
+bash scripts/run_single.sh code
 
 # Use a larger student — MODEL is an env var, any HF causal LM works:
-MODEL=Qwen/Qwen2.5-7B-Instruct        bash scripts/run_single.sh code aligned
-MODEL=Qwen/Qwen2.5-14B-Instruct       bash scripts/run_single.sh code aligned
-MODEL=Qwen/Qwen3-4B-Instruct-2507     bash scripts/run_single.sh code aligned
-MODEL=Qwen/Qwen3-14B-Instruct-2507    bash scripts/run_single.sh code aligned
+MODEL=Qwen/Qwen2.5-7B-Instruct        bash scripts/run_single.sh code
+MODEL=Qwen/Qwen2.5-14B-Instruct       bash scripts/run_single.sh code
+MODEL=Qwen/Qwen3-4B-Instruct-2507     bash scripts/run_single.sh code
+MODEL=Qwen/Qwen3-14B-Instruct-2507    bash scripts/run_single.sh code
 
-# Reproduce the full main table (6 runs, ~10-14h on a single 24 GB GPU):
+# Reproduce the full main table (3 runs, ~5-7h on a single 24 GB GPU):
 bash scripts/reproduce_all.sh
 ```
 
-Each run writes `results.json` to `results/<task>_<loss>/` with four methods:
+Each run writes `results.json` to `results/<task>/` with four methods:
 `baseline`, `inference_hooks`, `ssd_plain`, `ssd_enhanced`.
 
 ---
@@ -40,8 +40,8 @@ Each run writes `results.json` to `results/<task>_<loss>/` with four methods:
 ├── utils.py               # gradient collection, SVD, projection helpers
 ├── requirements.txt       # pip dependencies
 ├── scripts/
-│   ├── run_single.sh      # run one (task, loss) combination
-│   └── reproduce_all.sh   # run all 6 combinations + summary table
+│   ├── run_single.sh      # run one task
+│   └── reproduce_all.sh   # run all 3 tasks + summary table
 └── examples/              # sample outputs (see below)
 ```
 
@@ -80,19 +80,17 @@ Scaling study across five Qwen Instruct checkpoints (all chat-tuned, standard-GQ
 | **`Qwen/Qwen3-4B-Instruct-2507`** | Qwen3 | 4B | 8 GB | ~16–20 GB | ≥ 4.51 |
 | **`Qwen/Qwen3-14B-Instruct-2507`** | Qwen3 | 14B | 28 GB | ~48–56 GB | ≥ 4.51 |
 
-Design — both Qwen2.5 and Qwen3 families are included so reviewers can separate **scaling effects** (0.5 → 14B inside Qwen2.5) from **architecture effects** (Qwen2.5-14B vs Qwen3-14B at the same size).
-
 Pick your student by setting `MODEL`:
 
 ```bash
 # Qwen2.5 family (any transformers ≥ 4.44)
-MODEL=Qwen/Qwen2.5-0.5B-Instruct   bash scripts/reproduce_all.sh   # ~10-14 h on RTX-4090
-MODEL=Qwen/Qwen2.5-7B-Instruct     bash scripts/reproduce_all.sh   # ~24-32 h on A100-80
-MODEL=Qwen/Qwen2.5-14B-Instruct    bash scripts/reproduce_all.sh   # ~48-60 h on A100-80
+MODEL=Qwen/Qwen2.5-0.5B-Instruct   bash scripts/reproduce_all.sh   # ~5-7 h on RTX-4090
+MODEL=Qwen/Qwen2.5-7B-Instruct     bash scripts/reproduce_all.sh   # ~12-16 h on A100-80
+MODEL=Qwen/Qwen2.5-14B-Instruct    bash scripts/reproduce_all.sh   # ~24-30 h on A100-80
 
 # Qwen3 family (requires transformers ≥ 4.51 — pip install -r requirements.txt)
-MODEL=Qwen/Qwen3-4B-Instruct-2507  bash scripts/reproduce_all.sh   # ~30-40 h on RTX-4090
-MODEL=Qwen/Qwen3-14B-Instruct-2507 bash scripts/reproduce_all.sh   # ~60-80 h on A100-80
+MODEL=Qwen/Qwen3-4B-Instruct-2507  bash scripts/reproduce_all.sh   # ~15-20 h on RTX-4090
+MODEL=Qwen/Qwen3-14B-Instruct-2507 bash scripts/reproduce_all.sh   # ~30-40 h on A100-80
 ```
 
 ---
@@ -100,9 +98,9 @@ MODEL=Qwen/Qwen3-14B-Instruct-2507 bash scripts/reproduce_all.sh   # ~60-80 h on
 ## The method in 4 steps
 
 ```
-[1] Find     SVD on gradients of a calibration loss → per-layer projection
-             matrices P_K, P_V. Rank is auto-selected per layer to preserve
-             95% of gradient energy (so it adapts to each model's d_kv).
+[1] Find     SVD on gradients of a correctness-aligned CE loss → per-layer
+             projection matrices P_K, P_V. Rank is auto-selected per layer
+             to preserve 95% of gradient energy.
 [2] Hook     Register forward hooks at [last, middle] attention layers that
              apply K → K·P_K and V → V·P_V.
 [3] Sample   With hooks active, student generates N completions from prompts.
@@ -115,34 +113,31 @@ Every run of `ssd_subspace.py` produces **four methods** that together isolate e
 
 | Method | Hook at gen? | Hook at eval? | Fine-tuned? | What it tests |
 |---|---|---|---|---|
-| `baseline` | ❌ | ❌ | ❌ | Pre-training reference. |
-| `inference_hooks` | — | ✅ | ❌ | Training-free projection. |
-| `ssd_plain` | ❌ | ❌ | ✅ | Vanilla self-distillation (no subspace). |
-| `ssd_enhanced` | ✅ | ❌ | ✅ | SSD-Subspace (our method). |
+| `baseline` | - | - | - | Pre-training reference. |
+| `inference_hooks` | — | Yes | - | Training-free projection. |
+| `ssd_plain` | - | - | Yes | Vanilla self-distillation (no subspace). |
+| `ssd_enhanced` | Yes | - | Yes | SSD-Subspace (our method). |
 
 ---
 
 ## Quickstart — running one task
 
 ```bash
-# Code: MBPP training, assertion-only CE for subspace, dual-eval (MBPP + CodeAlpaca)
-bash scripts/run_single.sh code aligned
+# Code: MBPP training (464 examples), assertion-only CE for subspace, dual-eval (MBPP + CodeAlpaca)
+bash scripts/run_single.sh code
 
-# Math: GSM8K training, answer-only CE, dual-eval (GSM8K + SVAMP)
-bash scripts/run_single.sh math aligned
+# Math: GSM8K training (7473 examples), answer-only CE, dual-eval (GSM8K + SVAMP)
+bash scripts/run_single.sh math
 
-# MMLU: MMLU training, answer-only CE, dual-eval (MMLU + BBH)
-bash scripts/run_single.sh mmlu aligned
-
-# Use "default" instead of "aligned" for the vanilla-CE baseline variant:
-bash scripts/run_single.sh code default
+# MMLU: MMLU training (2000 examples), answer-only CE, dual-eval (MMLU + BBH)
+bash scripts/run_single.sh mmlu
 ```
 
 Override the student via the `MODEL` env var:
 
 ```bash
-MODEL=Qwen/Qwen3-4B-Instruct-2507  bash scripts/run_single.sh math aligned
-MODEL=Qwen/Qwen3-14B-Instruct-2507 bash scripts/run_single.sh mmlu aligned
+MODEL=Qwen/Qwen3-4B-Instruct-2507  bash scripts/run_single.sh math
+MODEL=Qwen/Qwen3-14B-Instruct-2507 bash scripts/run_single.sh mmlu
 ```
 
 ---
@@ -153,11 +148,11 @@ MODEL=Qwen/Qwen3-14B-Instruct-2507 bash scripts/run_single.sh mmlu aligned
 bash scripts/reproduce_all.sh
 ```
 
-This runs 3 tasks × 2 loss variants = 6 experiments sequentially, then prints a collated metric table at the end. Results land in `results/<task>_<loss>/results.json`.
+This runs 3 tasks sequentially, then prints a collated metric table at the end. Results land in `results/<task>/results.json`.
 
-Expected approximate numbers — reference scales (Qwen2.5-0.5B-Instruct, reported in the paper). Rerun with Qwen3-0.6B / -4B / -14B to reproduce the scaling study:
+Expected approximate numbers — reference scales (Qwen2.5-0.5B-Instruct, reported in the paper):
 
-| Domain | Metric | `baseline` | `ssd_plain` | `ssd_enhanced` (aligned) |
+| Domain | Metric | `baseline` | `ssd_plain` | `ssd_enhanced` |
 |---|---|---|---|---|
 | Code (MBPP) | pass@1 | 11.7% | 30.7% | **20.2%** |
 | Math | GSM8K / SVAMP | 11% / 16% | 11% / 12% | **19% / 27%** |
@@ -175,7 +170,7 @@ All options live on `ssd_subspace.py`; `run_single.sh` just wraps the common one
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `--model` | `Qwen/Qwen3-0.6B` | Any HF causal LM with standard `self_attn.{k_proj, v_proj}`. We report Qwen3-0.6B / 4B / 14B in the paper. |
+| `--model` | `Qwen/Qwen3-0.6B` | Any HF causal LM with standard `self_attn.{k_proj, v_proj}`. |
 | `--task` | `math` | `math`, `code`, or `mmlu` |
 | `--n_train` | task-dependent | Number of prompts for SSD sample generation + fine-tuning |
 | `--n_calibration` | task-dependent | Examples used for gradient SVD |
@@ -197,26 +192,20 @@ All options live on `ssd_subspace.py`; `run_single.sh` just wraps the common one
 | `--code_train` | `mbpp` / `codealpaca` | Code training source |
 | `--code_eval` | `mbpp_sanitized` / `codealpaca` / `both` | Code eval dataset(s) |
 
-### The key ablation knob
+### Calibration
 
 | Flag | Choices | Purpose |
 |---|---|---|
-| `--calibration_source` | `default` / `mbpp_solutions` / `answer_only` | Which tokens contribute gradient during subspace extraction |
+| `--calibration_source` | `aligned` / `mbpp_solutions` / `answer_only` | Which tokens contribute gradient during subspace extraction. `aligned` (default) auto-selects per task. |
 | `--project_mode` | `both` / `k_only` / `v_only` | Project K, V, or both |
 
----
+The correctness-aligned CE masks all tokens except the ones that define correctness:
 
-## The two loss variants (the central finding)
-
-Both variants use next-token cross-entropy. They differ only in which tokens' labels are *not* masked to `-100`:
-
-| Variant | `--calibration_source` | Valid tasks | Tokens that contribute gradient |
-|---|---|---|---|
-| Full CE | `default` | all | Every token in calibration text |
-| Assertion-only CE | `mbpp_solutions` | code | Only tokens inside `assert …` strings |
-| Answer-only CE | `answer_only` | math / mmlu | Only the numeric or letter answer |
-
-Empirically, the correctness-aligned variants consistently outperform `default` for `ssd_enhanced` (MBPP: **6.6% → 20.2%**; GSM8K: **13% → 19%**; MMLU: **48% → 48.5%**).
+| Task | Tokens that contribute gradient |
+|---|---|
+| Code | Only tokens inside `assert ...` strings (assertion-only CE) |
+| Math | Only the numeric answer after `####` (answer-only CE) |
+| MMLU | Only the answer letter token (answer-only CE) |
 
 ---
 
@@ -224,7 +213,7 @@ Empirically, the correctness-aligned variants consistently outperform `default` 
 
 ```jsonc
 {
-  "timestamp": "2026-…",
+  "timestamp": "2026-...",
   "config": { /* all CLI args */ },
   "target_layers": [23, 12],
   "projections": {
@@ -257,11 +246,11 @@ Primary-metric keys by task and eval:
 
 ## Datasets
 
-| Domain | In-domain (train + eval) | Transfer (eval only) |
-|---|---|---|
-| Code | MBPP (`mbpp`, `sanitized` split) | CodeAlpaca-20k (`sahil2801/CodeAlpaca-20k`) |
-| Math | GSM8K (`openai/gsm8k`, `main`) | SVAMP (`ChilleD/SVAMP`) |
-| QA | MMLU (`cais/mmlu`, `all`) | BBH (`lukaemon/bbh`), 6 subtasks |
+| Domain | Training | In-domain eval | Transfer eval |
+|---|---|---|---|
+| Code | MBPP train+val (464) | MBPP sanitized (pass@1) | CodeAlpaca-20k (NLL + AST) |
+| Math | GSM8K train (7473) | GSM8K test (accuracy) | SVAMP (accuracy) |
+| QA | MMLU aux_train (2000) | MMLU test (accuracy) | BBH, 6 subtasks (accuracy) |
 
 All datasets are auto-downloaded via the HuggingFace `datasets` library on first use.
 
@@ -275,9 +264,9 @@ BBH subtasks used (all single-token answer formats):
 The bash scripts work under Git Bash / WSL. For native PowerShell you can run:
 
 ```powershell
-python ssd_subspace.py --task mmlu --calibration_source answer_only `
+python ssd_subspace.py --task mmlu `
     --n_train 2000 --n_calibration 500 --n_eval 200 `
-    --output_dir results/mmlu_aligned
+    --output_dir results/mmlu
 ```
 
 ---
@@ -290,17 +279,11 @@ No. The student bootstraps from its own generations. Ground-truth answers only a
 **Q: Why are `ssd_plain` samples sometimes as good as `ssd_enhanced`?**
 When the task is already well-formed (MBPP code completion), the student's natural samples are often on-manifold. The subspace projection helps most when the natural distribution has substantial off-capability noise (math reasoning, MMLU letter answers).
 
-**Q: Do I need GPUs for all 6 reproduction runs?**
-Yes, realistically. CPU fine-tuning on 7473 GSM8K samples would take days. A single consumer GPU (RTX 3090 / 4090) handles Qwen2.5-0.5B comfortably.
-
 **Q: Can I scale up the student model?**
 Yes — the paper runs five Qwen Instruct checkpoints (Qwen2.5-0.5B / 7B / 14B and Qwen3-4B / 14B, all `-Instruct` variants) under the identical pipeline. Just pass `--model` or set `MODEL`. No need to hand-tune `--rank` for different model sizes — the default `--rank 0 --rank_energy 0.95` auto-selects rank per layer.
 
 **Q: How does `--rank 0 --rank_energy 0.95` work?**
-For each target layer and each of K / V separately, we compute the full SVD of the gradient matrix, then pick the smallest rank whose top singular values cumulatively capture ≥95% of the squared energy. This lets the rank adapt to the model's `d_kv` (which differs wildly across families — Qwen2.5-0.5B has `d_kv=128`; Qwen3-4B has `d_kv=512`; Qwen3-14B has `d_kv=1024`). Fixed rank=64 would be a drastically different fraction of the KV space on each.
-
-**Q: Why Qwen2.5 AND Qwen3, both Instruct?**
-Qwen2.5 covers three sizes (0.5B / 7B / 14B) with mature tooling (transformers ≥ 4.44). Qwen3 adds two more (4B / 14B Instruct-2507) with the newer architecture (8 KV heads, wider `d_kv`). Together we get five data points that separate **scaling** (Qwen2.5: 0.5B → 14B) from **architecture** (Qwen2.5-14B vs Qwen3-14B at the same size). All five are pure-text, standard-GQA — compatible with the hook design. Multimodal Qwen3.5 variants (e.g. `Qwen3.5-0.8B`) use hybrid linear/full attention that doesn't cleanly expose `k_proj`/`v_proj` at every layer, so they're out of scope here.
+For each target layer and each of K / V separately, we compute the full SVD of the gradient matrix, then pick the smallest rank whose top singular values cumulatively capture >=95% of the squared energy. This lets the rank adapt to the model's `d_kv` (which differs wildly across families — Qwen2.5-0.5B has `d_kv=128`; Qwen3-4B has `d_kv=512`; Qwen3-14B has `d_kv=1024`). Fixed rank=64 would be a drastically different fraction of the KV space on each.
 
 ---
 

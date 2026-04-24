@@ -608,17 +608,21 @@ def main():
     parser.add_argument("--project_mode", default="both",
                         choices=["both", "k_only", "v_only"],
                         help="Which KV projections to apply in hooks.")
-    parser.add_argument("--calibration_source", default="default",
-                        choices=["default", "mbpp_solutions", "answer_only"],
-                        help="'default' = use task's train set; "
-                             "'mbpp_solutions' = MBPP refs + assertion-only CE "
-                             "(task=code); "
-                             "'answer_only' = mask everything except the final "
-                             "answer letter token (task=mmlu, analog of "
-                             "assertion-only for MC tasks).")
+    parser.add_argument("--calibration_source", default="aligned",
+                        choices=["aligned", "mbpp_solutions", "answer_only"],
+                        help="Correctness-aligned CE: gradient only on "
+                             "assertion tokens (code) or answer tokens "
+                             "(math/MMLU). 'aligned' auto-selects per task; "
+                             "'mbpp_solutions' / 'answer_only' override.")
     parser.add_argument("--output_dir", default="results/ssd_subspace")
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
+
+    if args.calibration_source == "aligned":
+        if args.task == "code":
+            args.calibration_source = "mbpp_solutions"
+        else:
+            args.calibration_source = "answer_only"
 
     os.makedirs(args.output_dir, exist_ok=True)
     print("=" * 60)

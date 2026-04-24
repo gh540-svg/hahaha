@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Reproduce the paper's main table: 6 runs =
-# 3 domains (code/math/mmlu) × 2 loss variants (default/aligned).
+# Reproduce the paper's main table: 3 runs =
+# 3 domains (code/math/mmlu) with correctness-aligned CE.
 #
 # Each run emits results.json with all 4 methods
 # (baseline, inference_hooks, ssd_plain, ssd_enhanced).
 #
-# Total wall time on a single RTX-3090/4090 with Qwen2.5-0.5B-Instruct: ~10-14h.
+# Total wall time on a single RTX-3090/4090 with Qwen2.5-0.5B-Instruct: ~5-7h.
 
 set -eu
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
@@ -15,9 +15,7 @@ export MODEL="${MODEL:-Qwen/Qwen2.5-0.5B-Instruct}"
 export OUT_BASE="${OUT_BASE:-results}"
 
 for TASK in code math mmlu; do
-  for LOSS in default aligned; do
-    bash scripts/run_single.sh "$TASK" "$LOSS"
-  done
+  bash scripts/run_single.sh "$TASK"
 done
 
 echo
