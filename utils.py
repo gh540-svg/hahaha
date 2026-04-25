@@ -144,6 +144,7 @@ def extract_subspace(
     gradient_matrix: torch.Tensor,
     rank: int = 32,
     energy_threshold: Optional[float] = None,
+    half_rank: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, int]:
     """
     SVD on gradient matrix to extract capability subspace.
@@ -152,6 +153,8 @@ def extract_subspace(
         gradient_matrix: [N, d] gradient matrix
         rank: number of top singular directions to keep
         energy_threshold: if set, auto-select rank to capture this fraction of energy
+        half_rank: if True, use half of the full KV dimension as rank
+                   (e.g. 64 for 0.5B with kv_dim=128, 256 for 7B with kv_dim=512)
 
     Returns:
         V_r: [d, r] top-r right singular vectors (capability subspace basis)
@@ -165,8 +168,9 @@ def extract_subspace(
     # SVD
     U, S, Vt = torch.linalg.svd(G, full_matrices=False)
 
-    # Auto-select rank by energy threshold
-    if energy_threshold is not None:
+    if half_rank:
+        rank = G.shape[1] // 2
+    elif energy_threshold is not None:
         cumulative_energy = torch.cumsum(S ** 2, dim=0) / (S ** 2).sum()
         rank = int((cumulative_energy < energy_threshold).sum().item()) + 1
         rank = min(rank, S.shape[0])

@@ -427,15 +427,21 @@ class SubspaceHooks:
 
 def compute_student_projections(model, tokenizer, calibration_texts,
                                  target_layers, rank, device, max_length=256,
-                                 label_char_spans=None, energy_threshold=None):
-    """If energy_threshold is set (e.g. 0.95), rank is auto-chosen per (layer, K/V)
-    to preserve that fraction of gradient energy. Otherwise, uses fixed rank."""
+                                 label_char_spans=None, energy_threshold=None,
+                                 half_rank=False):
+    """Rank selection modes (checked in order):
+      1. half_rank=True: use half of the full KV dimension
+         (e.g. 64 for 0.5B kv_dim=128, 256 for 7B kv_dim=512)
+      2. energy_threshold (e.g. 0.95): auto-chosen per (layer, K/V)
+      3. fixed rank (int)
+    """
     grads = collect_kv_gradients(model, tokenizer, calibration_texts,
                                    target_layers, max_length=max_length, device=device,
                                    label_char_spans=label_char_spans)
-    # If auto-rank is requested, don't pass a fixed rank.
     extract_kwargs = {}
-    if energy_threshold is not None:
+    if half_rank:
+        extract_kwargs["half_rank"] = True
+    elif energy_threshold is not None:
         extract_kwargs["energy_threshold"] = energy_threshold
     else:
         extract_kwargs["rank"] = rank
@@ -581,11 +587,15 @@ def main():
     parser.add_argument("--n_calibration", type=int, default=50)
     parser.add_argument("--n_eval", type=int, default=100)
     parser.add_argument("--rank", type=int, default=0,
-                        help="Subspace rank. 0 (default) = auto via --rank_energy. "
-                             "Set >0 to force a fixed rank and ignore energy threshold.")
+                        help="Subspace rank. 0 (default) = half of KV dim. "
+                             "Set >0 to force a fixed rank.")
+    parser.add_argument("--rank_mode", default="half",
+                        choices=["half", "energy", "fixed"],
+                        help="Rank selection: 'half' = kv_dim//2 (default), "
+                             "'energy' = auto via --rank_energy threshold, "
+                             "'fixed' = use --rank value directly.")
     parser.add_argument("--rank_energy", type=float, default=0.95,
-                        help="If --rank is 0, auto-select rank per (layer, K/V) to "
-                             "preserve this fraction of gradient energy. Default 0.95.")
+                        help="Energy threshold for rank_mode='energy'. Default 0.95.")
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--lora_r", type=int, default=8)
@@ -861,14 +871,20 @@ def main():
     print(f"  baseline: {metric_name}={r[metric_name]:.4f}")
 
     # 2) Compute student's AutoKV projections at target layers
-    energy_thr = args.rank_energy if args.rank <= 0 else None
-    mode_desc = (f"energy-threshold {args.rank_energy:.3f} (auto rank)"
-                 if energy_thr is not None else f"fixed rank {args.rank}")
+    use_half = (args.rank_mode == "half")
+    energy_thr = args.rank_energy if args.rank_mode == "energy" else None
+    fixed_rank = args.rank if args.rank_mode == "fixed" else 0
+    if use_half:
+        mode_desc = "half KV dim"
+    elif energy_thr is not None:
+        mode_desc = f"energy-threshold {args.rank_energy:.3f} (auto rank)"
+    else:
+        mode_desc = f"fixed rank {args.rank}"
     print(f"\n[2] Computing student's AutoKV subspace at layers {target_layers} ({mode_desc})...")
     projections = compute_student_projections(
-        student, tok, cal_texts, target_layers, args.rank, args.device,
+        student, tok, cal_texts, target_layers, fixed_rank, args.device,
         label_char_spans=locals().get("cal_label_spans"),
-        energy_threshold=energy_thr)
+        energy_threshold=energy_thr, half_rank=use_half)
     for layer, p in projections.items():
         print(f"  L{layer}: rank_K={p['rank_K']:3d} (energy {p['energy_K']:.3f}), "
               f"rank_V={p['rank_V']:3d} (energy {p['energy_V']:.3f})")

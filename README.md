@@ -99,8 +99,9 @@ MODEL=Qwen/Qwen3-14B-Instruct-2507 bash scripts/reproduce_all.sh   # ~30-40 h on
 
 ```
 [1] Find     SVD on gradients of a correctness-aligned CE loss → per-layer
-             projection matrices P_K, P_V. Rank is auto-selected per layer
-             to preserve 95% of gradient energy.
+             projection matrices P_K, P_V. Default rank = half of KV dim
+             (e.g. 64 for 0.5B, 256 for 7B). Also supports energy-threshold
+             and fixed-rank modes.
 [2] Hook     Register forward hooks at [last, middle] attention layers that
              apply K → K·P_K and V → V·P_V.
 [3] Sample   With hooks active, student generates N completions from prompts.
@@ -175,8 +176,9 @@ All options live on `ssd_subspace.py`; `run_single.sh` just wraps the common one
 | `--n_train` | task-dependent | Number of prompts for SSD sample generation + fine-tuning |
 | `--n_calibration` | task-dependent | Examples used for gradient SVD |
 | `--n_eval` | `100`–`200` | Evaluation examples per dataset |
-| `--rank` | `0` (auto) | Subspace rank. `0` = auto via `--rank_energy`. `>0` forces fixed rank. |
-| `--rank_energy` | `0.95` | If `--rank=0`, pick rank per (layer, K/V) that preserves this fraction of gradient energy. |
+| `--rank_mode` | `half` | `half` = kv_dim//2 (default), `energy` = auto via `--rank_energy`, `fixed` = use `--rank` value. |
+| `--rank` | `0` | Subspace rank (only used when `--rank_mode fixed`). |
+| `--rank_energy` | `0.95` | Energy threshold (only used when `--rank_mode energy`). |
 | `--epochs` | `5` | Fine-tuning epochs |
 | `--lora_r` | `8` | LoRA rank for adapter |
 | `--lr` | `1e-5` | Fine-tuning learning rate |
@@ -280,10 +282,10 @@ No. The student bootstraps from its own generations. Ground-truth answers only a
 When the task is already well-formed (MBPP code completion), the student's natural samples are often on-manifold. The subspace projection helps most when the natural distribution has substantial off-capability noise (math reasoning, MMLU letter answers).
 
 **Q: Can I scale up the student model?**
-Yes — the paper runs five Qwen Instruct checkpoints (Qwen2.5-0.5B / 7B / 14B and Qwen3-4B / 14B, all `-Instruct` variants) under the identical pipeline. Just pass `--model` or set `MODEL`. No need to hand-tune `--rank` for different model sizes — the default `--rank 0 --rank_energy 0.95` auto-selects rank per layer.
+Yes — the paper runs five Qwen Instruct checkpoints (Qwen2.5-0.5B / 7B / 14B and Qwen3-4B / 14B, all `-Instruct` variants) under the identical pipeline. Just pass `--model` or set `MODEL`. The default `--rank_mode half` uses kv_dim//2, which scales automatically across model sizes.
 
-**Q: How does `--rank 0 --rank_energy 0.95` work?**
-For each target layer and each of K / V separately, we compute the full SVD of the gradient matrix, then pick the smallest rank whose top singular values cumulatively capture >=95% of the squared energy. This lets the rank adapt to the model's `d_kv` (which differs wildly across families — Qwen2.5-0.5B has `d_kv=128`; Qwen3-4B has `d_kv=512`; Qwen3-14B has `d_kv=1024`). Fixed rank=64 would be a drastically different fraction of the KV space on each.
+**Q: How does `--rank_mode half` work?**
+The default rank selection uses half of the KV projection dimension (e.g. 64 for 0.5B with kv_dim=128, 256 for 7B with kv_dim=512). This scales proportionally across model sizes without hand-tuning. Alternative modes: `--rank_mode energy --rank_energy 0.95` auto-selects the smallest rank capturing 95% of gradient energy (can be as low as rank 2 for math on 7B), or `--rank_mode fixed --rank 64` for a fixed value.
 
 ---
 
