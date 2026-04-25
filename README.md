@@ -155,7 +155,7 @@ Expected approximate numbers — reference scales (Qwen2.5-0.5B-Instruct, report
 
 | Domain | Metric | `baseline` | `ssd_plain` | `ssd_enhanced` |
 |---|---|---|---|---|
-| Code (MBPP) | pass@1 | 11.7% | 30.7% | **20.2%** |
+| Code | MBPP / CodeAlpaca (NLL↓) | 11.7% / 0.683 | 30.7% / 0.682 | **20.2%** / **0.679** |
 | Math | GSM8K / SVAMP | 11% / 16% | 11% / 12% | **19% / 27%** |
 | MMLU | MMLU / BBH | 46% / 32% | 48% / 38% | **48.5% / 37.3%** |
 
