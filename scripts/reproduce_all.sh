@@ -22,15 +22,52 @@ echo
 echo "=== DONE. Collected results below. ==="
 python - <<'PY'
 import json, os, glob
-rows = []
+
+methods = ["baseline", "inference_hooks", "ssd_plain", "ssd_enhanced"]
+
 for f in sorted(glob.glob("results/*/results.json")):
     with open(f) as fh: d = json.load(fh)
-    cfg = d["config"]; r = d["results"]
-    tag = os.path.basename(os.path.dirname(f))
-    for method in ["baseline", "inference_hooks", "ssd_plain", "ssd_enhanced"]:
-        m = r.get(method, {})
-        primary = m.get("accuracy") or m.get("pass@1") or m.get("mmlu_accuracy") or m.get("gsm8k_accuracy") or m.get("mbpp_pass@1")
-        rows.append((tag, method, primary))
-for t, m, v in rows:
-    print(f"{t:40s}  {m:16s}  {v if v is None else f'{v:.4f}'}")
+    task = d["config"].get("task", os.path.basename(os.path.dirname(f)))
+    r = d["results"]
+
+    if task == "math":
+        hdr = f"{'Method':20s} {'GSM8K':>8s} {'SVAMP':>8s}"
+        print(f"\n  {task.upper()}")
+        print(f"  {hdr}")
+        print(f"  {'-' * len(hdr)}")
+        for method in methods:
+            m = r.get(method, {})
+            g = m.get("gsm8k_accuracy", m.get("accuracy"))
+            s = m.get("svamp_accuracy", m.get("accuracy"))
+            gstr = f"{g:.2%}" if g is not None else "N/A"
+            sstr = f"{s:.2%}" if s is not None else "N/A"
+            print(f"  {method:20s} {gstr:>8s} {sstr:>8s}")
+
+    elif task == "code":
+        hdr = f"{'Method':20s} {'MBPP':>8s} {'CA_NLL':>8s} {'CA_AST':>8s}"
+        print(f"\n  {task.upper()}")
+        print(f"  {hdr}")
+        print(f"  {'-' * len(hdr)}")
+        for method in methods:
+            m = r.get(method, {})
+            mbpp = m.get("mbpp_pass@1", m.get("pass@1"))
+            nll = m.get("ca_nll", m.get("nll"))
+            ast_ = m.get("ca_ast_parse_rate", m.get("ast_parse_rate"))
+            mstr = f"{mbpp:.2%}" if mbpp is not None else "N/A"
+            nstr = f"{nll:.3f}" if nll is not None else "N/A"
+            astr = f"{ast_:.2%}" if ast_ is not None else "N/A"
+            print(f"  {method:20s} {mstr:>8s} {nstr:>8s} {astr:>8s}")
+
+    elif task == "mmlu":
+        hdr = f"{'Method':20s} {'MMLU':>8s} {'BBH':>8s}"
+        print(f"\n  {task.upper()}")
+        print(f"  {hdr}")
+        print(f"  {'-' * len(hdr)}")
+        for method in methods:
+            m = r.get(method, {})
+            mm = m.get("mmlu_accuracy", m.get("accuracy"))
+            bb = m.get("bbh_accuracy")
+            mstr = f"{mm:.2%}" if mm is not None else "N/A"
+            bstr = f"{bb:.2%}" if bb is not None else "N/A"
+            print(f"  {method:20s} {mstr:>8s} {bstr:>8s}")
 PY
