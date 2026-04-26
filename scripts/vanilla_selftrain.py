@@ -15,12 +15,11 @@ Eval datasets:
   QA:    MMLU test, BBH (6 subtasks)
 
 Usage:
-  python vanilla_selftrain.py --model Qwen/Qwen2.5-0.5B-Instruct \
+  python scripts/vanilla_selftrain.py --model Qwen/Qwen2.5-0.5B-Instruct \
       --domains math,code,mmlu --epochs 5 --output_dir results/vanilla
 """
-import argparse, ast, gc, json, os, random, re, subprocess, sys, tempfile, time
+import argparse, gc, json, os, random, re, sys, time
 from datetime import datetime
-from typing import Dict, List
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -32,401 +31,25 @@ import numpy as np
 import torch
 from datasets import load_dataset
 from peft import LoraConfig, get_peft_model
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_cosine_schedule_with_warmup
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Data loading
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def load_svamp(n_eval: int) -> List[Dict[str, str]]:
-    for path, split in [("ChilleD/SVAMP", "test"), ("ChilleD/SVAMP", "train")]:
-        try:
-            ds = load_dataset(path, split=split)
-            break
-        except Exception:
-            continue
-    if n_eval and n_eval > 0:
-        ds = ds.select(range(min(n_eval, len(ds))))
-    examples = []
-    for ex in ds:
-        body = str(ex.get("Body", ex.get("body", ""))).strip()
-        q = str(ex.get("Question", ex.get("question", ex.get("input", "")))).strip()
-        if body and q and body not in q: q = f"{body} {q}"
-        elif body and not q: q = body
-        ans = ex.get("Answer", ex.get("answer", ex.get("target", ex.get("label", ""))))
-        examples.append({"question": q, "answer": str(ans)})
-    return examples
+# Import from the shared ssd_subspace module (repo root)
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from ssd_subspace import (
+    TextDataset, generate_samples,
+    eval_svamp, eval_mbpp, eval_codealpaca, eval_mmlu, eval_bbh,
+    load_svamp, load_mbpp_sanitized_test, load_codealpaca_eval,
+    load_mmlu, load_bbh, load_mmlu_for_training,
+    format_mc_prompt,
+)
 
 
-def load_mbpp_sanitized_test() -> List[Dict]:
-    ds = load_dataset("mbpp", "sanitized", split="test")
-    records = []
-    for ex in ds:
-        records.append({
-            "task_id": ex["task_id"],
-            "text": ex.get("prompt", ex.get("text", "")),
-            "code": ex["code"],
-            "test_list": ex["test_list"],
-            "test_setup_code": ex.get("test_setup_code", ""),
-        })
-    return records
-
-
-def load_codealpaca_eval(n_eval: int) -> List[Dict]:
-    try:
-        ds = load_dataset("sahil2801/CodeAlpaca-20k", split="train")
-    except Exception:
-        ds = load_dataset("theblackcat102/codealpha-cleaned", split="train")
-    n = len(ds)
-    idxs = list(range(max(0, n - n_eval), n))
-    records = []
-    for i in idxs:
-        ex = ds[i]
-        instr = ex.get("instruction", ex.get("prompt", ""))
-        code = ex.get("output", ex.get("completion", ""))
-        if not instr or not code:
-            continue
-        records.append({"instruction": instr, "code": code})
-    return records
-
-
-MMLU_LETTERS = ["A", "B", "C", "D"]
-
-
-def load_mmlu(n_eval: int, split: str = "test") -> List[Dict]:
-    ds = load_dataset("cais/mmlu", "all", split=split)
-    if n_eval and n_eval > 0:
-        ds = ds.shuffle(seed=42).select(range(min(n_eval, len(ds))))
-    records = []
-    for ex in ds:
-        if len(ex["choices"]) != 4: continue
-        records.append({
-            "question": ex["question"],
-            "choices": ex["choices"],
-            "answer_idx": int(ex["answer"]),
-            "answer": MMLU_LETTERS[int(ex["answer"])],
-            "subject": ex.get("subject", ""),
-        })
-    return records
-
-
-def load_mmlu_for_training(n_total: int) -> List[Dict]:
-    try:
-        ds = load_dataset("cais/mmlu", "all", split="auxiliary_train")
-    except Exception:
-        ds = load_dataset("cais/mmlu", "all", split="dev")
-    ds = ds.shuffle(seed=42)
-    records = []
-    for ex in ds:
-        if len(ex["choices"]) != 4: continue
-        records.append({
-            "question": ex["question"],
-            "choices": ex["choices"],
-            "answer_idx": int(ex["answer"]),
-            "answer": MMLU_LETTERS[int(ex["answer"])],
-        })
-        if len(records) >= n_total: break
-    return records
-
-
-BBH_SUBTASKS = [
-    "logical_deduction_three_objects",
-    "date_understanding",
-    "movie_recommendation",
-    "boolean_expressions",
-    "causal_judgement",
-    "sports_understanding",
-]
-
-
-def load_bbh(n_per_task: int = 50) -> List[Dict]:
-    records = []
-    for task in BBH_SUBTASKS:
-        ds = None
-        for path in [("lukaemon/bbh", task, "test"),
-                     ("maveriq/bigbenchhard", task, "train")]:
-            try:
-                ds = load_dataset(path[0], path[1], split=path[2])
-                break
-            except Exception:
-                continue
-        if ds is None: continue
-        ds = ds.select(range(min(n_per_task, len(ds))))
-        for ex in ds:
-            records.append({
-                "task": task,
-                "input": ex["input"],
-                "target": str(ex["target"]).strip(),
-            })
-    return records
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Evaluation functions
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def extract_numeric(text):
-    matches = re.findall(r"[-+]?\d*\.?\d+", str(text).replace(",", ""))
-    return matches[-1] if matches else ""
-
-
-def answers_match(pred, gold, tol=1e-4):
-    if not pred or not gold: return False
-    try: return abs(float(pred) - float(gold)) <= tol
-    except ValueError: return pred.strip() == gold.strip()
-
-
-def eval_svamp(model, tokenizer, examples, device, label=""):
-    model.eval()
-    correct = 0
-    for ex in tqdm(examples, desc=f"SVAMP {label}", leave=False):
-        prompt = f"Question: {ex['question']}\nAnswer:"
-        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=384).to(device)
-        with torch.no_grad():
-            out = model.generate(**inputs, max_new_tokens=256, do_sample=False,
-                                  use_cache=True, pad_token_id=tokenizer.eos_token_id)
-        resp = tokenizer.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
-        if answers_match(extract_numeric(resp), extract_numeric(ex["answer"])):
-            correct += 1
-    total = len(examples)
-    return {"accuracy": correct / total if total else 0, "correct": correct, "total": total}
-
-
-def extract_code(text):
-    m = re.search(r"```(?:python)?\s*\n(.*?)```", text, re.DOTALL)
-    return m.group(1) if m else text
-
-
-def execute_mbpp(code, test_list, setup_code="", timeout=5):
-    script = (setup_code + "\n" if setup_code else "") + code + "\n"
-    for t in test_list:
-        script += t + "\n"
-    try:
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, encoding="utf-8") as f:
-            f.write(script); fp = f.name
-        r = subprocess.run([sys.executable, fp], capture_output=True, timeout=timeout, text=True)
-        return r.returncode == 0
-    except Exception:
-        return False
-    finally:
-        try: os.unlink(fp)
-        except Exception: pass
-
-
-def eval_mbpp(model, tokenizer, records, device, label=""):
-    model.eval()
-    passed = 0
-    for ex in tqdm(records, desc=f"MBPP {label}", leave=False):
-        prompt = (f"Instruction: {ex['text']}\nYour code should pass these tests:\n"
-                  + "\n".join(ex["test_list"]) + "\nCode:")
-        inputs = tokenizer(prompt, return_tensors="pt", truncation=True,
-                           max_length=1024).to(device)
-        with torch.no_grad():
-            out = model.generate(**inputs, max_new_tokens=512, do_sample=False,
-                                  use_cache=True, pad_token_id=tokenizer.eos_token_id)
-        resp = tokenizer.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
-        code = extract_code(resp)
-        for stop in ["\nclass ", "\nif __name__", "\n\n\n"]:
-            idx = code.find(stop)
-            if idx > 0: code = code[:idx]; break
-        if execute_mbpp(code, ex["test_list"], ex.get("test_setup_code", "")):
-            passed += 1
-    return {"pass@1": passed / len(records), "correct": passed, "total": len(records)}
-
-
-def eval_codealpaca(model, tokenizer, records, device, label=""):
-    model.eval()
-    nll_total, tok_total = 0.0, 0
-    parses, generated = 0, 0
-    for ex in tqdm(records, desc=f"CodeAlpaca {label}", leave=False):
-        prompt = f"Instruction: {ex['instruction']}\nCode:"
-        full = prompt + " " + ex["code"]
-        enc_prompt = tokenizer(prompt, return_tensors="pt", truncation=True,
-                                max_length=512).to(device)
-        enc_full = tokenizer(full, return_tensors="pt", truncation=True,
-                              max_length=1024).to(device)
-        prompt_len = enc_prompt["input_ids"].shape[1]
-        full_len = enc_full["input_ids"].shape[1]
-        if full_len > prompt_len:
-            labels = enc_full["input_ids"].clone()
-            labels[:, :prompt_len] = -100
-            with torch.no_grad():
-                logits = model(**enc_full).logits
-            shift_logits = logits[:, :-1, :]
-            shift_labels = labels[:, 1:]
-            loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-100, reduction="sum")
-            nll = loss_fct(shift_logits.reshape(-1, shift_logits.size(-1)),
-                           shift_labels.reshape(-1)).item()
-            completion_toks = int((shift_labels != -100).sum().item())
-            if completion_toks > 0:
-                nll_total += nll
-                tok_total += completion_toks
-        with torch.no_grad():
-            gen = model.generate(**enc_prompt, max_new_tokens=256, do_sample=False,
-                                  use_cache=True, pad_token_id=tokenizer.eos_token_id)
-        resp = tokenizer.decode(gen[0][enc_prompt["input_ids"].shape[1]:],
-                                skip_special_tokens=True)
-        code = extract_code(resp)
-        for stop in ["\nclass ", "\nif __name__", "\n\n\n"]:
-            idx = code.find(stop)
-            if idx > 0:
-                code = code[:idx]; break
-        generated += 1
-        try:
-            ast.parse(code)
-            parses += 1
-        except Exception:
-            pass
-    mean_nll = (nll_total / tok_total) if tok_total else float("nan")
-    return {
-        "nll": mean_nll,
-        "ppl": float(np.exp(mean_nll)) if tok_total else float("nan"),
-        "ast_parse_rate": parses / generated if generated else 0.0,
-        "parses": parses,
-        "total": generated,
-    }
-
-
-def format_mc_prompt(question: str, choices: List[str]) -> str:
-    opts = "\n".join(f"{MMLU_LETTERS[i]}. {c}" for i, c in enumerate(choices))
-    return f"Question: {question}\n{opts}\nAnswer:"
-
-
-def eval_mmlu(model, tokenizer, records, device, label=""):
-    model.eval()
-    correct = 0
-    for ex in tqdm(records, desc=f"MMLU {label}", leave=False):
-        prompt = format_mc_prompt(ex["question"], ex["choices"])
-        inputs = tokenizer(prompt, return_tensors="pt", truncation=True,
-                           max_length=512).to(device)
-        with torch.no_grad():
-            out = model.generate(**inputs, max_new_tokens=5, do_sample=False,
-                                  use_cache=True, pad_token_id=tokenizer.eos_token_id)
-        resp = tokenizer.decode(out[0][inputs["input_ids"].shape[1]:],
-                                skip_special_tokens=True).strip()
-        pred = ""
-        for ch in resp:
-            if ch.upper() in MMLU_LETTERS:
-                pred = ch.upper(); break
-        if pred == ex["answer"]:
-            correct += 1
-    total = len(records)
-    return {"accuracy": correct / total if total else 0.0, "correct": correct, "total": total}
-
-
-def _normalize_bbh(s: str) -> str:
-    return s.strip().strip(".").strip().lower()
-
-
-def _extract_bbh_answer(resp: str, task: str) -> str:
-    s = resp.strip().split("\n", 1)[0].strip()
-    if task == "boolean_expressions":
-        low = s.lower()
-        if "true" in low: return "True"
-        if "false" in low: return "False"
-        return s
-    if task in ("causal_judgement", "sports_understanding"):
-        low = s.lower()
-        if low.startswith("yes") or " yes" in low[:10]:
-            return "Yes" if task == "causal_judgement" else "yes"
-        if low.startswith("no") or " no" in low[:10]:
-            return "No" if task == "causal_judgement" else "no"
-        return s
-    m = re.search(r"\(([A-F])\)", s)
-    if m: return f"({m.group(1)})"
-    m = re.search(r"\b([A-F])\b", s)
-    if m: return f"({m.group(1)})"
-    return s
-
-
-def eval_bbh(model, tokenizer, records, device, label=""):
-    model.eval()
-    correct = 0
-    per_task_correct = {t: 0 for t in BBH_SUBTASKS}
-    per_task_total = {t: 0 for t in BBH_SUBTASKS}
-    for ex in tqdm(records, desc=f"BBH {label}", leave=False):
-        prompt = f"{ex['input']}\nAnswer:"
-        inputs = tokenizer(prompt, return_tensors="pt", truncation=True,
-                           max_length=1024).to(device)
-        with torch.no_grad():
-            out = model.generate(**inputs, max_new_tokens=16, do_sample=False,
-                                  use_cache=True, pad_token_id=tokenizer.eos_token_id)
-        resp = tokenizer.decode(out[0][inputs["input_ids"].shape[1]:],
-                                skip_special_tokens=True)
-        pred = _extract_bbh_answer(resp, ex["task"])
-        per_task_total[ex["task"]] += 1
-        if _normalize_bbh(pred) == _normalize_bbh(ex["target"]):
-            correct += 1
-            per_task_correct[ex["task"]] += 1
-    total = len(records)
-    per_task_acc = {
-        t: (per_task_correct[t] / per_task_total[t]) if per_task_total[t] else 0.0
-        for t in BBH_SUBTASKS
-    }
-    return {"accuracy": correct / total if total else 0.0,
-            "correct": correct, "total": total,
-            "per_task_accuracy": per_task_acc}
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Sample generation (no top_p filtering)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def generate_samples(model, tokenizer, prompts, device, batch_size=8,
-                     max_new_tokens=256, temperature=0.7):
-    """Generate samples with temperature sampling but NO top_p filtering."""
-    model.eval()
-    tokenizer.padding_side = "left"
-    texts = []
-    for i in tqdm(range(0, len(prompts), batch_size), desc="Sampling", leave=False):
-        batch_p = prompts[i:i+batch_size]
-        inputs = tokenizer(batch_p, return_tensors="pt", truncation=True,
-                           max_length=384, padding=True).to(device)
-        with torch.no_grad():
-            out = model.generate(**inputs, max_new_tokens=max_new_tokens,
-                                  do_sample=True, temperature=temperature,
-                                  use_cache=True, pad_token_id=tokenizer.eos_token_id)
-        for seq in out:
-            decoded = tokenizer.decode(seq, skip_special_tokens=True)
-            decoded = decoded.replace("\x00", "")
-            if len(decoded) > 8192:
-                decoded = decoded[:8192]
-            texts.append(decoded)
-    tokenizer.padding_side = "right"
-    return texts
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Training
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class TextDataset(Dataset):
-    def __init__(self, texts, tokenizer, max_length=256):
-        self.examples = []
-        skipped = 0
-        for t in texts:
-            if not isinstance(t, str): skipped += 1; continue
-            t = t.replace("\x00", "")
-            if len(t) > 8192: t = t[:8192]
-            if not t.strip(): skipped += 1; continue
-            try:
-                enc = tokenizer(t, truncation=True, max_length=max_length,
-                                 padding="max_length", return_tensors="pt")
-            except BaseException:
-                skipped += 1; continue
-            self.examples.append({
-                "input_ids": enc["input_ids"].squeeze(0),
-                "attention_mask": enc["attention_mask"].squeeze(0),
-            })
-        if skipped:
-            print(f"  [TextDataset] skipped {skipped}/{len(texts)} malformed samples",
-                  flush=True)
-
-    def __len__(self): return len(self.examples)
-    def __getitem__(self, i): return self.examples[i]
+def cuda_cleanup():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def train_lora(model_name, tokenizer, samples, lora_config, epochs, lr, device, seed=42):
@@ -473,16 +96,6 @@ def train_lora(model_name, tokenizer, samples, lora_config, epochs, lr, device, 
         print(f"    ep={epoch+1}/{epochs}: loss={avg:.4f}", flush=True)
         torch.cuda.empty_cache()
     return student, losses
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Experiment pipeline
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def cuda_cleanup():
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
 
 
 def load_all_eval_data(n_eval):
@@ -588,7 +201,7 @@ def run_domain(domain, model_name, tok, eval_data, args, lora_cfg):
     print(f"  Train prompts: {len(train_prompts)}", flush=True)
     domain_results = {}
 
-    # ── Step 1: Baseline eval ──
+    # Step 1: Baseline eval
     print(f"\n  [{domain}] Baseline eval on all 6 datasets...", flush=True)
     base_model = AutoModelForCausalLM.from_pretrained(
         model_name, torch_dtype=torch.bfloat16, device_map=device)
@@ -601,21 +214,22 @@ def run_domain(domain, model_name, tok, eval_data, args, lora_cfg):
           f"mmlu={baseline_r['mmlu_accuracy']:.2%} bbh={baseline_r['bbh_accuracy']:.2%}",
           flush=True)
 
-    # ── Step 2: Generate self-training samples (no top_p) ──
+    # Step 2: Generate self-training samples (no top_p)
     print(f"\n  [{domain}] Generating vanilla samples (temperature=0.7, no top_p)...",
           flush=True)
     vanilla_samples = generate_samples(
-        base_model, tok, train_prompts, device, batch_size=8, temperature=0.7)
+        base_model, tok, train_prompts, device, batch_size=8,
+        temperature=0.7, top_p=1.0)
     print(f"    Generated {len(vanilla_samples)} samples", flush=True)
     del base_model; cuda_cleanup()
 
-    # ── Step 3: Train LoRA on self-generated samples ──
+    # Step 3: Train LoRA on self-generated samples
     print(f"\n  [{domain}] Training vanilla_selftrain (LoRA)...", flush=True)
     trained_model, train_losses = train_lora(
         model_name, tok, vanilla_samples, lora_cfg, args.epochs, args.lr, device)
     domain_results["train_losses"] = train_losses
 
-    # ── Step 4: Evaluate trained model on all 6 datasets ──
+    # Step 4: Evaluate trained model on all 6 datasets
     print(f"  [{domain}] vanilla_selftrain eval on all 6 datasets...", flush=True)
     r = eval_all_6(trained_model, tok, eval_data, device)
     domain_results["vanilla_selftrain"] = r
@@ -687,7 +301,7 @@ def main():
     print("=" * 60, flush=True)
     print("Vanilla Self-Training Cross-Domain Experiment", flush=True)
     print(f"Model: {args.model} | Epochs: {args.epochs}", flush=True)
-    print(f"Generation: temperature=0.7, NO top_p (unconstrained sampling)", flush=True)
+    print(f"Generation: temperature=0.7, top_p=1.0 (no nucleus filtering)", flush=True)
     print("=" * 60, flush=True)
 
     tok = AutoTokenizer.from_pretrained(args.model)
